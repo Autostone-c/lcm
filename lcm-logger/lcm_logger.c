@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 
 // Several thread and synchronization API functions (e.g. g_mutex_init,
 // g_cond_init, g_thread_new, etc) require 2.32
@@ -301,11 +302,7 @@ static int open_logfile(logger_t *logger)
             logger->next_increment_num++;
         } while (g_file_test(logger->fname, G_FILE_TEST_EXISTS));
     } else if (logger->rotate > 0) {
-        int ret = snprintf(logger->fname, sizeof(logger->fname), "%s.0", logger->fname_prefix);
-        if (ret < 0) {
-            fprintf(stderr, "Error: failed to create filename string");
-            return 1;
-        }
+        snprintf(logger->fname, sizeof(logger->fname), "%s.0", logger->fname_prefix);
     } else {
         strcpy(logger->fname, logger->fname_prefix);
         if (!(logger->force_overwrite || logger->append)) {
@@ -331,9 +328,16 @@ static int open_logfile(logger_t *logger)
     // use write mode if not.
     const char *logmode = (logger->rotate > 0 || logger->append) ? "a" : "w";
     logger->log = lcm_eventlog_create(logger->fname, logmode);
-    if (logger->log == NULL) {
+    if (!logger->log) {
         perror("Error: fopen failed");
         return 1;
+    }
+    // 初始化 logsize 为当前文件大小（用于后续轮转判断）
+    if (logger->rotate > 0 || logger->append) {
+        struct stat st;
+        if (stat(logger->fname, &st) == 0) {
+            logger->logsize = st.st_size;  // 记录当前文件大小
+        }
     }
     return 0;
 }
@@ -345,9 +349,19 @@ static void *write_thread(void *user_data)
     while (1) {
         void *msg = g_async_queue_pop(logger->write_queue);
 
+	// 新增：检查当前文件大小是否超过限制
+        double logsize_mb = (double)logger->logsize / (1 << 20);
+        gboolean split_log = (logger->auto_split_mb > 0 && logsize_mb > logger->auto_split_mb);
+        if (split_log || _reset_logfile) {
+            lcm_eventlog_destroy(logger->log);
+            rotate_logfiles(logger);  // 轮转 FILE.0 -> FILE.1
+            open_logfile(logger);     // 重新打开 FILE.0（新建空文件）
+            logger->logsize = 0;      // 重置大小计数
+        }
+
         // ---
         // Is it time to start a new logfile?
-        gboolean split_log = 0;
+        split_log = 0;
         if (logger->auto_split_mb) {
             double logsize_mb = (double) logger->logsize / (1 << 20);
             split_log = (logsize_mb > logger->auto_split_mb);
@@ -824,9 +838,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "ERROR.  --increment and --rotate can't both be used\n");
         return 1;
     }
-    if (logger.force_overwrite && logger.append) {
-        fprintf(stderr, "ERROR.  --force_overwrite and --append can't both be used\n");
-    }
+    //if (logger.force_overwrite && logger.append) {
+    //    fprintf(stderr, "ERROR.  --force_overwrite and --append can't both be used\n");
+    //}
 
     logger.time0 = g_get_real_time();
     logger.max_write_queue_size = (int64_t) (max_write_queue_size_mb * (1 << 20));
